@@ -1,0 +1,64 @@
+name: Browser Desktop (noVNC • Windows)
+on: workflow_dispatch
+
+env:
+  # You can override these with repo secrets (VNC_PASS / VNC_VIEW_PASS).
+  VNC_PASS: ${{ secrets.VNC_PASS }}
+  VNC_VIEW_PASS: ${{ secrets.VNC_VIEW_PASS }}
+
+jobs:
+  desktop:
+    runs-on: windows-latest
+    steps:
+      - name: Install UltraVNC (server)
+        shell: pwsh
+        run: |
+          choco install -y ultravnc
+          $uvnc = "${env:ProgramFiles}\uvnc bvba\UltraVNC"
+          if (!(Test-Path $uvnc)) { $uvnc = "${env:ProgramFiles(x86)}\uvnc bvba\UltraVNC" }
+          $full = if ($env:VNC_PASS) { $env:VNC_PASS } else { "changeme123" }
+          $view = if ($env:VNC_VIEW_PASS) { $env:VNC_VIEW_PASS } else { "viewonly" }
+
+          # Set VNC passwords (writes to ultravnc.ini)
+          if (Test-Path "$uvnc\setpasswd.exe") {
+            & "$uvnc\setpasswd.exe" $full $view
+          } else {
+            Write-Host "WARN: setpasswd.exe not found; UltraVNC may reject connections until a password is set."
+          }
+
+          # Start UltraVNC server in application mode (listens on 5900)
+          Start-Process -FilePath "$uvnc\winvnc.exe" -ArgumentList "-run" -WindowStyle Hidden
+
+      - name: Fetch and start noVNC proxy
+        shell: pwsh
+        run: |
+          git clone https://github.com/novnc/noVNC $env:USERPROFILE\noVNC
+          git clone https://github.com/novnc/websockify $env:USERPROFILE\noVNC\utils\websockify
+          # Start noVNC's WebSocket proxy (serves noVNC UI on http://localhost:6080)
+          Start-Process -FilePath "python" -ArgumentList "$env:USERPROFILE\noVNC\utils\novnc_proxy --vnc localhost:5900 --listen 6080" -WindowStyle Hidden
+
+      - name: Expose noVNC via Cloudflare Tunnel (prints clickable URL)
+        shell: pwsh
+        run: |
+          Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile cloudflared.exe
+          $null = Remove-Item -Force -ErrorAction SilentlyContinue .\cloudflared.log
+          $p = Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:6080 --no-autoupdate" -NoNewWindow -PassThru -RedirectStandardOutput cloudflared.log
+          # Wait for the trycloudflare URL to appear
+          for ($i=0; $i -lt 40; $i++) {
+            Start-Sleep -Seconds 2
+            $m = (Select-String -Path cloudflared.log -Pattern 'https://[-a-z0-9]+\.trycloudflare\.com' | Select-Object -Last 1)
+            if ($m) { $URL = $m.Matches[0].Value; break }
+          }
+          if (-not $URL) { throw "Cloudflare tunnel URL not detected. Check 'cloudflared.log' in job artifacts." }
+
+          Write-Host "--------------------------------------------------------"
+          Write-Host "noVNC base: $URL"
+          Write-Host "One-click URL:"
+          Write-Host "$URL/vnc.html?autoconnect=1&resize=remote&path=websockify"
+          Write-Host "VNC password: $env:VNC_PASS"
+          Write-Host "--------------------------------------------------------"
+
+      - name: Keep alive
+        shell: pwsh
+        run: |
+          while ($true) { Write-Host "alive $(Get-Date -Format o)"; Start-Sleep -Seconds 60 }
