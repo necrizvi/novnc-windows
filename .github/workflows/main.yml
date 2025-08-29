@@ -1,64 +1,97 @@
-name: Browser Desktop (noVNC • Windows)
+name: Browser Desktop (noVNC) – Windows Server 2022
 on: workflow_dispatch
-
-env:
-  # You can override these with repo secrets (VNC_PASS / VNC_VIEW_PASS).
-  VNC_PASS: ${{ secrets.VNC_PASS }}
-  VNC_VIEW_PASS: ${{ secrets.VNC_VIEW_PASS }}
 
 jobs:
   desktop:
-    runs-on: windows-latest
+    runs-on: windows-latest   # Windows Server 2022 on GitHub-hosted runners
+    timeout-minutes: 360
+
     steps:
-      - name: Install UltraVNC (server)
+      - name: Prep PowerShell
         shell: pwsh
         run: |
-          choco install -y ultravnc
-          $uvnc = "${env:ProgramFiles}\uvnc bvba\UltraVNC"
-          if (!(Test-Path $uvnc)) { $uvnc = "${env:ProgramFiles(x86)}\uvnc bvba\UltraVNC" }
-          $full = if ($env:VNC_PASS) { $env:VNC_PASS } else { "changeme123" }
-          $view = if ($env:VNC_VIEW_PASS) { $env:VNC_VIEW_PASS } else { "viewonly" }
+          $ErrorActionPreference = 'Stop'
+          Write-Host "Windows version:" (Get-ComputerInfo).OsName (Get-ComputerInfo).OsVersion
 
-          # Set VNC passwords (writes to ultravnc.ini)
-          if (Test-Path "$uvnc\setpasswd.exe") {
-            & "$uvnc\setpasswd.exe" $full $view
-          } else {
-            Write-Host "WARN: setpasswd.exe not found; UltraVNC may reject connections until a password is set."
+      - name: Install Chocolatey
+        shell: pwsh
+        run: |
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
+          Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          choco --version
+
+      - name: Install TightVNC Server
+        shell: pwsh
+        run: |
+          choco install tightvnc -y
+          $tvnExe = "${env:ProgramFiles}\TightVNC\tvnserver.exe"
+          if (-not (Test-Path $tvnExe)) { throw "TightVNC tvnserver.exe not found at $tvnExe" }
+
+          # Install and configure TightVNC service
+          & $tvnExe -install
+
+          # Set password (primary) to vnc@4321 (no env vars)
+          # Newer TightVNC supports -controlservice -password; fallback also sets registry keys.
+          try {
+            & $tvnExe -controlservice -password "vnc@4321"
+          } catch {
+            Write-Warning "Falling back to registry-based password configuration."
+            $bytes = [System.Text.Encoding]::ASCII.GetBytes("vnc@4321")
+            New-Item -Path 'HKLM:\Software\TightVNC\Server' -Force | Out-Null
+            # TightVNC expects an obfuscated binary; the direct plaintext is a fallback and may not work on all versions.
+            # If needed, you can swap this for a precomputed REG_BINARY for the Password value.
+            New-ItemProperty -Path 'HKLM:\Software\TightVNC\Server' -Name 'Password' -PropertyType Binary -Value $bytes -Force | Out-Null
           }
 
-          # Start UltraVNC server in application mode (listens on 5900)
-          Start-Process -FilePath "$uvnc\winvnc.exe" -ArgumentList "-run" -WindowStyle Hidden
+          # Allow connections from localhost (websockify) and start service
+          New-ItemProperty -Path 'HKLM:\Software\TightVNC\Server' -Name 'AllowLoopback' -PropertyType DWord -Value 1 -Force | Out-Null
+          Start-Service -Name tvnserver
 
-      - name: Fetch and start noVNC proxy
+      - name: Clone noVNC
         shell: pwsh
         run: |
           git clone https://github.com/novnc/noVNC $env:USERPROFILE\noVNC
-          git clone https://github.com/novnc/websockify $env:USERPROFILE\noVNC\utils\websockify
-          # Start noVNC's WebSocket proxy (serves noVNC UI on http://localhost:6080)
-          Start-Process -FilePath "python" -ArgumentList "$env:USERPROFILE\noVNC\utils\novnc_proxy --vnc localhost:5900 --listen 6080" -WindowStyle Hidden
 
-      - name: Expose noVNC via Cloudflare Tunnel (prints clickable URL)
+      - name: Install Python deps (websockify)
         shell: pwsh
         run: |
-          Invoke-WebRequest -Uri https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe -OutFile cloudflared.exe
-          $null = Remove-Item -Force -ErrorAction SilentlyContinue .\cloudflared.log
-          $p = Start-Process -FilePath ".\cloudflared.exe" -ArgumentList "tunnel --url http://localhost:6080 --no-autoupdate" -NoNewWindow -PassThru -RedirectStandardOutput cloudflared.log
-          # Wait for the trycloudflare URL to appear
-          for ($i=0; $i -lt 40; $i++) {
-            Start-Sleep -Seconds 2
-            $m = (Select-String -Path cloudflared.log -Pattern 'https://[-a-z0-9]+\.trycloudflare\.com' | Select-Object -Last 1)
-            if ($m) { $URL = $m.Matches[0].Value; break }
-          }
-          if (-not $URL) { throw "Cloudflare tunnel URL not detected. Check 'cloudflared.log' in job artifacts." }
+          python --version
+          pip install --upgrade pip
+          pip install websockify
 
-          Write-Host "--------------------------------------------------------"
-          Write-Host "noVNC base: $URL"
-          Write-Host "One-click URL:"
-          Write-Host "$URL/vnc.html?autoconnect=1&resize=remote&path=websockify"
-          Write-Host "VNC password: $env:VNC_PASS"
-          Write-Host "--------------------------------------------------------"
+      - name: Start websockify (VNC WS bridge)
+        shell: pwsh
+        run: |
+          # Bridge noVNC websocket :5901 -> TightVNC :5900
+          Start-Process -WindowStyle Hidden -FilePath python -ArgumentList "-m","websockify","--web","$env:USERPROFILE\noVNC","5901","localhost:5900" 
+
+      - name: Serve noVNC on :6080
+        shell: pwsh
+        run: |
+          # Host noVNC static files on http://127.0.0.1:6080
+          Push-Location $env:USERPROFILE\noVNC
+          Start-Process -WindowStyle Hidden -FilePath python -ArgumentList "-m","http.server","6080"
+          Pop-Location
+
+      - name: Download & run cloudflared
+        shell: pwsh
+        run: |
+          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
+          $cfExe = "$env:USERPROFILE\cloudflared.exe"
+          Invoke-WebRequest -Uri $cfUrl -OutFile $cfExe
+          # Expose local HTTP server (noVNC) via Cloudflare tunnel
+          Start-Process -FilePath $cfExe -ArgumentList "tunnel","--url","http://127.0.0.1:6080","--no-autoupdate" -RedirectStandardOutput "$env:USERPROFILE\tunnel.log" -RedirectStandardError "$env:USERPROFILE\tunnel.log"
+          Start-Sleep -Seconds 10
+          Write-Host "----------------------------------------------------"
+          Write-Host "Your noVNC URL(s):"
+          (Get-Content "$env:USERPROFILE\tunnel.log" -Raw) -split "`n" | Select-String -Pattern 'https://[-a-z0-9]+\.trycloudflare\.com' -AllMatches | ForEach-Object { $_.Matches.Value } | Sort-Object -Unique | ForEach-Object { Write-Host $_ }
+          Write-Host "----------------------------------------------------"
+          Write-Host "VNC password: vnc@4321"
+          Write-Host "If the noVNC page loads but does not connect, open 'vnc.html?path=websockify&host=127.0.0.1&port=5901' on that URL."
+          Write-Host "----------------------------------------------------"
 
       - name: Keep alive
         shell: pwsh
         run: |
-          while ($true) { Write-Host "alive $(Get-Date -Format o)"; Start-Sleep -Seconds 60 }
+          for ($i=0; $i -lt 43200; $i++) { Write-Host "alive $(Get-Date)"; Start-Sleep -Seconds 60 }
