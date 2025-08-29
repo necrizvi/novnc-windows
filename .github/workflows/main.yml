@@ -3,7 +3,7 @@ on: workflow_dispatch
 
 jobs:
   remote:
-    runs-on: windows-latest   # Windows Server 2022 runner
+    runs-on: windows-latest    # Windows Server 2022 runner
     timeout-minutes: 360
 
     steps:
@@ -13,41 +13,50 @@ jobs:
           $ErrorActionPreference = 'Stop'
           Write-Host "OS:" (Get-ComputerInfo).OsName (Get-ComputerInfo).OsVersion
 
-      - name: Download RustDesk (portable)
+      - name: Install Chocolatey
         shell: pwsh
         run: |
-          # Grab latest stable portable build (x64)
-          $url = "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-1.2.3-x86_64-pc-windows-msvc-portable.zip"
-          $zip = "$env:USERPROFILE\rustdesk.zip"
-          $dir = "$env:USERPROFILE\rustdesk"
-          Invoke-WebRequest -Uri $url -OutFile $zip
-          if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
-          Expand-Archive -Path $zip -DestinationPath $dir
-          Get-ChildItem $dir
+          Set-ExecutionPolicy Bypass -Scope Process -Force
+          [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+          Invoke-Expression ((New-Object Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
+          choco --version
+
+      - name: Install RustDesk (portable)
+        shell: pwsh
+        run: |
+          choco install rustdesk.portable -y --no-progress
+          # Get the shimmed path to rustdesk.exe
+          $global:RustDeskExe = (Get-Command rustdesk.exe -ErrorAction Stop).Source
+          Write-Host "RustDesk exe: $global:RustDeskExe"
 
       - name: Set unattended password and start RustDesk
         shell: pwsh
         run: |
-          $rd = Get-ChildItem "$env:USERPROFILE\rustdesk\*.exe" | Where-Object { $_.Name -match 'rustdesk.*\.exe$' } | Select-Object -First 1
-          if (-not $rd) { throw "RustDesk executable not found." }
-
-          # Set permanent password (unattended access)
-          # Official docs: --password sets a permanent password; --get-id prints the ID. :contentReference[oaicite:0]{index=0}
-          & $rd.FullName --password "vnc@4321"
-
-          # Launch RustDesk elevated if possible (helps with UAC prompts)
-          # Portable elevation tips are documented by RustDesk. :contentReference[oaicite:1]{index=1}
-          Start-Process -FilePath $rd.FullName -Verb RunAs
-
+          $rd = (Get-Command rustdesk.exe).Source
+          # Set permanent password (no env vars)
+          & $rd --password "vnc@4321"
+          # Start RustDesk UI (helps with permissions/UAC)
+          Start-Process -FilePath $rd -WindowStyle Hidden
           Start-Sleep -Seconds 5
 
       - name: Show RustDesk ID (use this to connect)
         shell: pwsh
         run: |
-          $rd = Get-ChildItem "$env:USERPROFILE\rustdesk\*.exe" | Where-Object { $_.Name -match 'rustdesk.*\.exe$' } | Select-Object -First 1
-          $id = & $rd.FullName --get-id
+          $rd = (Get-Command rustdesk.exe).Source
+          $id = ""
+          for ($i=0; $i -lt 30 -and [string]::IsNullOrWhiteSpace($id); $i++) {
+            try {
+              $id = (& $rd --get-id) 2>$null
+              if (-not [string]::IsNullOrWhiteSpace($id)) { break }
+            } catch { }
+            Start-Sleep -Seconds 2
+          }
           Write-Host "----------------------------------------------------"
-          Write-Host "RustDesk ID: $id"
+          if ([string]::IsNullOrWhiteSpace($id)) {
+            Write-Host "RustDesk ID not yet available. Wait a bit and rerun the step/logs."
+          } else {
+            Write-Host "RustDesk ID: $id"
+          }
           Write-Host "Password   : vnc@4321"
           Write-Host "Open RustDesk on your computer, enter the ID above, and connect."
           Write-Host "----------------------------------------------------"
