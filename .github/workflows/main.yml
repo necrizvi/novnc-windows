@@ -1,9 +1,9 @@
-name: Browser Desktop (noVNC) – Windows Server 2022
+name: RustDesk Remote (Windows Server 2022)
 on: workflow_dispatch
 
 jobs:
-  desktop:
-    runs-on: windows-latest   # Windows Server 2022 on GitHub-hosted runners
+  remote:
+    runs-on: windows-latest   # Windows Server 2022 runner
     timeout-minutes: 360
 
     steps:
@@ -11,106 +11,51 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "Windows:" (Get-ComputerInfo).OsName (Get-ComputerInfo).OsVersion
+          Write-Host "OS:" (Get-ComputerInfo).OsName (Get-ComputerInfo).OsVersion
 
-      - name: Install Chocolatey
+      - name: Download RustDesk (portable)
         shell: pwsh
         run: |
-          Set-ExecutionPolicy Bypass -Scope Process -Force
-          [System.Net.ServicePointManager]::SecurityProtocol = [System.Net.SecurityProtocolType]::Tls12
-          Invoke-Expression ((New-Object System.Net.WebClient).DownloadString('https://community.chocolatey.org/install.ps1'))
-          choco --version
+          # Grab latest stable portable build (x64)
+          $url = "https://github.com/rustdesk/rustdesk/releases/latest/download/rustdesk-1.2.3-x86_64-pc-windows-msvc-portable.zip"
+          $zip = "$env:USERPROFILE\rustdesk.zip"
+          $dir = "$env:USERPROFILE\rustdesk"
+          Invoke-WebRequest -Uri $url -OutFile $zip
+          if (Test-Path $dir) { Remove-Item $dir -Recurse -Force }
+          Expand-Archive -Path $zip -DestinationPath $dir
+          Get-ChildItem $dir
 
-      - name: Install TightVNC Server
+      - name: Set unattended password and start RustDesk
         shell: pwsh
         run: |
-          choco install tightvnc -y
-          $tvnExe = "${env:ProgramFiles}\TightVNC\tvnserver.exe"
-          if (-not (Test-Path $tvnExe)) { throw "TightVNC tvnserver.exe not found at $tvnExe" }
+          $rd = Get-ChildItem "$env:USERPROFILE\rustdesk\*.exe" | Where-Object { $_.Name -match 'rustdesk.*\.exe$' } | Select-Object -First 1
+          if (-not $rd) { throw "RustDesk executable not found." }
 
-          # Install service
-          & $tvnExe -install
+          # Set permanent password (unattended access)
+          # Official docs: --password sets a permanent password; --get-id prints the ID. :contentReference[oaicite:0]{index=0}
+          & $rd.FullName --password "vnc@4321"
 
-          # Set password to vnc@4321 (no env vars)
-          # Primary method:
-          try {
-            & $tvnExe -controlservice -password "vnc@4321"
-          } catch {
-            Write-Warning "Falling back to registry-based configuration."
-            New-Item -Path 'HKLM:\Software\TightVNC\Server' -Force | Out-Null
-            # Allow loopback so local websockify can connect
-            New-ItemProperty -Path 'HKLM:\Software\TightVNC\Server' -Name 'AllowLoopback' -PropertyType DWord -Value 1 -Force | Out-Null
-          }
+          # Launch RustDesk elevated if possible (helps with UAC prompts)
+          # Portable elevation tips are documented by RustDesk. :contentReference[oaicite:1]{index=1}
+          Start-Process -FilePath $rd.FullName -Verb RunAs
 
-          # Start service
-          Start-Service -Name tvnserver
+          Start-Sleep -Seconds 5
 
-      - name: Clone noVNC
+      - name: Show RustDesk ID (use this to connect)
         shell: pwsh
         run: |
-          git clone https://github.com/novnc/noVNC $env:USERPROFILE\noVNC
-
-      - name: Install Python deps (websockify)
-        shell: pwsh
-        run: |
-          python --version
-          pip install --upgrade pip
-          pip install websockify
-
-      - name: Start websockify (VNC WS bridge)
-        shell: pwsh
-        run: |
-          # Bridge websocket :5901 -> TightVNC :5900 and serve noVNC static files
-          Start-Process -WindowStyle Hidden -FilePath python -ArgumentList "-m","websockify","--web","$env:USERPROFILE\noVNC","5901","localhost:5900"
-
-      - name: Serve noVNC on :6080
-        shell: pwsh
-        run: |
-          Push-Location $env:USERPROFILE\noVNC
-          Start-Process -WindowStyle Hidden -FilePath python -ArgumentList "-m","http.server","6080"
-          Pop-Location
-
-      - name: Download & run cloudflared (fixed redirection)
-        shell: pwsh
-        run: |
-          $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
-          $cfExe = "$env:USERPROFILE\cloudflared.exe"
-          Invoke-WebRequest -Uri $cfUrl -OutFile $cfExe
-
-          $out = "$env:USERPROFILE\tunnel.out.log"
-          $err = "$env:USERPROFILE\tunnel.err.log"
-          if (Test-Path $out) { Remove-Item $out -Force }
-          if (Test-Path $err) { Remove-Item $err -Force }
-
-          # Start tunnel and redirect to DIFFERENT files (fixes your error)
-          Start-Process -FilePath $cfExe `
-            -ArgumentList @("tunnel","--url","http://127.0.0.1:6080","--no-autoupdate") `
-            -RedirectStandardOutput $out `
-            -RedirectStandardError $err `
-            -WindowStyle Hidden
-
-          Start-Sleep -Seconds 10
-
-          # Collect URL(s) from both logs
-          $urls = @()
-          if (Test-Path $out) {
-            $urls += (Get-Content $out -Raw | Select-String -AllMatches 'https://[-a-z0-9]+\.trycloudflare\.com').Matches.Value
-          }
-          if (Test-Path $err) {
-            $urls += (Get-Content $err -Raw | Select-String -AllMatches 'https://[-a-z0-9]+\.trycloudflare\.com').Matches.Value
-          }
-          $urls = $urls | Sort-Object -Unique
-
+          $rd = Get-ChildItem "$env:USERPROFILE\rustdesk\*.exe" | Where-Object { $_.Name -match 'rustdesk.*\.exe$' } | Select-Object -First 1
+          $id = & $rd.FullName --get-id
           Write-Host "----------------------------------------------------"
-          Write-Host "Your noVNC URL(s):"
-          if ($urls.Count) { $urls | ForEach-Object { Write-Host $_ } } else { Write-Host "(not found yet — tunnel still starting?)" }
-          Write-Host "----------------------------------------------------"
-          Write-Host "VNC password: vnc@4321"
-          Write-Host "If the page loads but doesn't auto-connect, go to:"
-          Write-Host "/vnc.html?path=websockify&host=127.0.0.1&port=5901"
+          Write-Host "RustDesk ID: $id"
+          Write-Host "Password   : vnc@4321"
+          Write-Host "Open RustDesk on your computer, enter the ID above, and connect."
           Write-Host "----------------------------------------------------"
 
       - name: Keep alive
         shell: pwsh
         run: |
-          for ($i=0; $i -lt 43200; $i++) { Write-Host "alive $(Get-Date)"; Start-Sleep -Seconds 60 }
+          for ($i=0; $i -lt 43200; $i++) {
+            Write-Host "alive $(Get-Date -Format s)"
+            Start-Sleep -Seconds 60
+          }
