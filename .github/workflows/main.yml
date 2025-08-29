@@ -11,7 +11,7 @@ jobs:
         shell: pwsh
         run: |
           $ErrorActionPreference = 'Stop'
-          Write-Host "Windows version:" (Get-ComputerInfo).OsName (Get-ComputerInfo).OsVersion
+          Write-Host "Windows:" (Get-ComputerInfo).OsName (Get-ComputerInfo).OsVersion
 
       - name: Install Chocolatey
         shell: pwsh
@@ -28,24 +28,21 @@ jobs:
           $tvnExe = "${env:ProgramFiles}\TightVNC\tvnserver.exe"
           if (-not (Test-Path $tvnExe)) { throw "TightVNC tvnserver.exe not found at $tvnExe" }
 
-          # Install and configure TightVNC service
+          # Install service
           & $tvnExe -install
 
-          # Set password (primary) to vnc@4321 (no env vars)
-          # Newer TightVNC supports -controlservice -password; fallback also sets registry keys.
+          # Set password to vnc@4321 (no env vars)
+          # Primary method:
           try {
             & $tvnExe -controlservice -password "vnc@4321"
           } catch {
-            Write-Warning "Falling back to registry-based password configuration."
-            $bytes = [System.Text.Encoding]::ASCII.GetBytes("vnc@4321")
+            Write-Warning "Falling back to registry-based configuration."
             New-Item -Path 'HKLM:\Software\TightVNC\Server' -Force | Out-Null
-            # TightVNC expects an obfuscated binary; the direct plaintext is a fallback and may not work on all versions.
-            # If needed, you can swap this for a precomputed REG_BINARY for the Password value.
-            New-ItemProperty -Path 'HKLM:\Software\TightVNC\Server' -Name 'Password' -PropertyType Binary -Value $bytes -Force | Out-Null
+            # Allow loopback so local websockify can connect
+            New-ItemProperty -Path 'HKLM:\Software\TightVNC\Server' -Name 'AllowLoopback' -PropertyType DWord -Value 1 -Force | Out-Null
           }
 
-          # Allow connections from localhost (websockify) and start service
-          New-ItemProperty -Path 'HKLM:\Software\TightVNC\Server' -Name 'AllowLoopback' -PropertyType DWord -Value 1 -Force | Out-Null
+          # Start service
           Start-Service -Name tvnserver
 
       - name: Clone noVNC
@@ -63,32 +60,54 @@ jobs:
       - name: Start websockify (VNC WS bridge)
         shell: pwsh
         run: |
-          # Bridge noVNC websocket :5901 -> TightVNC :5900
-          Start-Process -WindowStyle Hidden -FilePath python -ArgumentList "-m","websockify","--web","$env:USERPROFILE\noVNC","5901","localhost:5900" 
+          # Bridge websocket :5901 -> TightVNC :5900 and serve noVNC static files
+          Start-Process -WindowStyle Hidden -FilePath python -ArgumentList "-m","websockify","--web","$env:USERPROFILE\noVNC","5901","localhost:5900"
 
       - name: Serve noVNC on :6080
         shell: pwsh
         run: |
-          # Host noVNC static files on http://127.0.0.1:6080
           Push-Location $env:USERPROFILE\noVNC
           Start-Process -WindowStyle Hidden -FilePath python -ArgumentList "-m","http.server","6080"
           Pop-Location
 
-      - name: Download & run cloudflared
+      - name: Download & run cloudflared (fixed redirection)
         shell: pwsh
         run: |
           $cfUrl = "https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-windows-amd64.exe"
           $cfExe = "$env:USERPROFILE\cloudflared.exe"
           Invoke-WebRequest -Uri $cfUrl -OutFile $cfExe
-          # Expose local HTTP server (noVNC) via Cloudflare tunnel
-          Start-Process -FilePath $cfExe -ArgumentList "tunnel","--url","http://127.0.0.1:6080","--no-autoupdate" -RedirectStandardOutput "$env:USERPROFILE\tunnel.log" -RedirectStandardError "$env:USERPROFILE\tunnel.log"
+
+          $out = "$env:USERPROFILE\tunnel.out.log"
+          $err = "$env:USERPROFILE\tunnel.err.log"
+          if (Test-Path $out) { Remove-Item $out -Force }
+          if (Test-Path $err) { Remove-Item $err -Force }
+
+          # Start tunnel and redirect to DIFFERENT files (fixes your error)
+          Start-Process -FilePath $cfExe `
+            -ArgumentList @("tunnel","--url","http://127.0.0.1:6080","--no-autoupdate") `
+            -RedirectStandardOutput $out `
+            -RedirectStandardError $err `
+            -WindowStyle Hidden
+
           Start-Sleep -Seconds 10
+
+          # Collect URL(s) from both logs
+          $urls = @()
+          if (Test-Path $out) {
+            $urls += (Get-Content $out -Raw | Select-String -AllMatches 'https://[-a-z0-9]+\.trycloudflare\.com').Matches.Value
+          }
+          if (Test-Path $err) {
+            $urls += (Get-Content $err -Raw | Select-String -AllMatches 'https://[-a-z0-9]+\.trycloudflare\.com').Matches.Value
+          }
+          $urls = $urls | Sort-Object -Unique
+
           Write-Host "----------------------------------------------------"
           Write-Host "Your noVNC URL(s):"
-          (Get-Content "$env:USERPROFILE\tunnel.log" -Raw) -split "`n" | Select-String -Pattern 'https://[-a-z0-9]+\.trycloudflare\.com' -AllMatches | ForEach-Object { $_.Matches.Value } | Sort-Object -Unique | ForEach-Object { Write-Host $_ }
+          if ($urls.Count) { $urls | ForEach-Object { Write-Host $_ } } else { Write-Host "(not found yet — tunnel still starting?)" }
           Write-Host "----------------------------------------------------"
           Write-Host "VNC password: vnc@4321"
-          Write-Host "If the noVNC page loads but does not connect, open 'vnc.html?path=websockify&host=127.0.0.1&port=5901' on that URL."
+          Write-Host "If the page loads but doesn't auto-connect, go to:"
+          Write-Host "/vnc.html?path=websockify&host=127.0.0.1&port=5901"
           Write-Host "----------------------------------------------------"
 
       - name: Keep alive
