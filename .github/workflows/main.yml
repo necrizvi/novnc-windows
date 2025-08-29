@@ -25,24 +25,21 @@ jobs:
         shell: pwsh
         run: |
           choco install rustdesk.portable -y --no-progress
-          # Find either rustdesk.exe or rustdesk-qs.exe in the Chocolatey tools folder
+          # Find rustdesk.exe or rustdesk-qs.exe in Chocolatey tools
           $tools = Join-Path $env:ProgramData "chocolatey\lib\rustdesk.portable\tools"
           if (-not (Test-Path $tools)) { throw "RustDesk tools folder not found: $tools" }
-          $candidates = @(
-            Join-Path $tools "rustdesk.exe"),
-            (Join-Path $tools "rustdesk-qs.exe"
-          )
-          $exe = $candidates | Where-Object { Test-Path $_ } | Select-Object -First 1
+          $exe = @(
+            Join-Path $tools "rustdesk.exe";
+            Join-Path $tools "rustdesk-qs.exe"
+          ) | Where-Object { Test-Path $_ } | Select-Object -First 1
           if (-not $exe) {
-            # Fallback: pick any rustdesk*.exe
             $exe = (Get-ChildItem -Path $tools -Filter "rustdesk*.exe" -ErrorAction Stop | Select-Object -First 1).FullName
           }
           if (-not $exe) { throw "RustDesk executable not found in $tools" }
           Write-Host "Using RustDesk executable: $exe"
-          # Persist path for later steps
           'RUSTDESK_EXE={0}' -f $exe | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
 
-      - name: Set unattended password and start RustDesk
+      - name: Set unattended password and start RustDesk (with relay args)
         shell: pwsh
         run: |
           $rd = $env:RUSTDESK_EXE
@@ -51,31 +48,42 @@ jobs:
           # Set permanent password (no env vars)
           & $rd --password "vnc@4321" | Out-Host
 
-          # Start RustDesk in background (hidden is fine)
-          Start-Process -FilePath $rd -WindowStyle Hidden
+          # Start RustDesk and explicitly point to public RustDesk relays
+          # These arguments help quick-support builds register an ID promptly.
+          $args = @(
+            "--relay-server","rs.rustdesk.net:21117",
+            "--api-server","rs.rustdesk.net",
+            "--key","rsa2048"
+          )
+          Start-Process -FilePath $rd -ArgumentList $args -WindowStyle Hidden
 
-          # Give it a moment to register / reach relay
-          Start-Sleep -Seconds 8
+          # Give it a little time to reach the relay
+          Start-Sleep -Seconds 15
 
       - name: Show RustDesk ID (use this to connect)
         shell: pwsh
         run: |
           $rd = $env:RUSTDESK_EXE
-          $id = ""
-          # Try up to ~60s for the ID to appear
-          for ($i=0; $i -lt 30 -and [string]::IsNullOrWhiteSpace($id); $i++) {
+
+          function TryGetId {
             try {
-              $id = (& $rd --get-id) 2>$null
-              if (-not [string]::IsNullOrWhiteSpace($id)) { break }
+              $val = (& $rd --get-id) 2>$null
+              if ($val) { return $val.Trim() }
             } catch { }
+            return ""
+          }
+
+          $id = ""
+          for ($i=0; $i -lt 60 -and [string]::IsNullOrWhiteSpace($id); $i++) {
+            $id = TryGetId
+            if (-not [string]::IsNullOrWhiteSpace($id)) { break }
             Start-Sleep -Seconds 2
           }
 
           Write-Host "----------------------------------------------------"
           if ([string]::IsNullOrWhiteSpace($id)) {
-            Write-Host "RustDesk ID not yet available. Let it run a bit longer, then re-check logs."
+            Write-Host "RustDesk ID not yet available. It may appear shortly—keep this job running and re-check logs."
           } else {
-            $id = $id.Trim()
             Write-Host "RustDesk ID: $id"
           }
           Write-Host "Password   : vnc@4321"
